@@ -1,0 +1,93 @@
+This process runs 10x Genomics' Space Ranger on the reads and images, performing spatial gene expression analysis by aligning reads to the reference genome.
+
+Notable outputs include:
+- gene expression matrices
+- .cloupe file: which can be visualized interactively in the Loupe Browser.
+
+container "quay.io/viascientific/spaceranger:3.1.2"
+
+
+script:
+
+in_cyt_assist = target_cytassist_img.toString().replaceFirst(/\.gz$/, '')
+
+in_microscope_img = ""
+in_pregz_microscope_img = ""
+
+if (target_microscope_image && target_microscope_image.exists() && target_microscope_image.size() > 0) {
+	in_pregz_microscope_img = target_microscope_image.toString()
+    in_microscope_img = target_microscope_image.toString().replaceFirst(/\.gz$/, '')
+} else {
+    println "No valid microscope image provided or the file is empty."
+}
+
+
+println "FASTQ 1: $fastq_1\nFASTQ 2: $fastq_2"
+println "CytAssist Image: $in_cyt_assist\nMicroscope image: $in_microscope_img"
+mvReads = "mv $fastq_1 $fastq_2 READS/"
+
+localmem = task.memory.toGiga().intValue()
+localcores = task.cpus - 2
+
+"""
+echo "=======Prepare Reads======="
+# The following naming for FASTQ files is expected {sample_id}_S1_L00[Lane Number]_[Read Type]_001.fastq.gz
+
+mkdir READS
+$mvReads
+
+ls -l READS
+
+echo "=======Variables======="
+echo "Sample name: $sample_id"
+
+echo "Spaceranger count requested cores: $localcores"
+echo "Spaceranger count requested memory: $localmem"
+
+echo "=======Extract Cytassist archive======="
+
+if [[ "$target_cytassist_img" == *.gz ]]; then
+    echo "Gunzip CytAssist image"
+    gunzip -c "$target_cytassist_img" > "$in_cyt_assist"
+fi
+
+echo "=======Microscope Image handling======="
+
+if [[ "$in_pregz_microscope_img" == *.gz ]]; then
+    echo "Gunzip Microscope image"
+    gunzip -c "$in_pregz_microscope_img" > "${in_microscope_img}"
+fi
+
+if [ -f "$in_microscope_img" ]; then
+	echo "Microscope image provided"
+    export microscope_cmd="--image ${in_microscope_img}"
+else
+	echo "No microscope image provided"
+    export microscope_cmd=""
+fi
+
+echo "=======Preparing reference======="
+echo "Reference: $reference_genome"
+mkdir REF
+tar -C REF/ --strip-components=1 -xzf $reference_genome
+
+echo "=======Running Spaceranger======="
+spaceranger count \
+    --id="${sample_id}" \
+    --sample="$sample_id" \
+	--transcriptome="REF" \
+	--fastqs="READS" \
+	--probe-set="$probe_set" \
+	--cytaimage="$in_cyt_assist" \
+	--localcores="$localcores"\
+	--localmem="$localmem" \
+	--disable-ui \
+	--create-bam=false \$microscope_cmd
+
+echo "=======Processing Spaceranger outputs======="
+tar --no-same-owner -zcf ${sample_id}.tar.gz ${sample_id}
+
+if [ -f "$in_microscope_img" ]; then
+	mv "${in_microscope_img}" "microscope.brightfield_image.tif"
+fi
+"""

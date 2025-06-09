@@ -1,0 +1,44 @@
+container "quay.io/viascientific/spatial-seurat:5.2.0"
+
+
+script:
+
+sample_outdir = sample_id + "_seurat"
+spaceranger_sample_out = sample_id + "_outs"
+
+var_features = "2000" //* @input @label:"# of Variable Features" @description:"Number of variable features. Used to generate anchors and intergrate datasets downstream; default is 2000"
+
+"""
+mkdir ${sample_id}
+tar -C ${sample_id} --strip-components=1 -xzf $in_spaceranger_outs
+
+mv ${sample_id}/outs ${spaceranger_sample_out}
+
+echo "Sample ID: $sample_id"
+
+mkdir -p ${sample_outdir}
+
+echo "listing current directory: \$(ls -l .)"
+echo "Turning on Set +x"
+
+set +x
+
+render-sample-anlys.R \
+  -x \$(which sample-anlys.Rmd) \
+  -i "\$(readlink -f ${spaceranger_sample_out})" \
+  -s "${sample_id}" \
+  -b "${bin_size}" \
+  -o "\$(readlink -f ${sample_outdir})" \
+  --detected_genes_low_threshold=0.01 \
+  --detected_genes_high_threshold=0.99 \
+  --umi_count_low_threshold=0.01 \
+  --umi_count_high_threshold=0.99 \
+  --ribosomal_contents_threshold=25 \
+  --mitochondrial_contents_threshold=50 \
+  --norm_method=${normalization_method} \
+  --varFeatures=${var_features} \
+  --remove_mito_genes=FALSE \
+  --remove_ribo_genes=FALSE \
+  --npcs=${npcs}
+
+"""

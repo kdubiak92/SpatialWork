@@ -1,0 +1,40 @@
+container "quay.io/viascientific/spaceranger:3.1.2"
+
+script:
+
+sample_name = name
+"""
+echo "=======Prepare Outputs======="
+echo "Sample Name: $sample_name"
+
+mkdir $sample_name
+tar -C $sample_name --strip-components=1 -xzf $in_targz
+
+
+ls -l $sample_name
+echo "Sample output dir" && ls -l ${sample_name}/outs
+
+echo "=======Processing Spaceranger outputs======="
+mv ${sample_name}/outs ${name}_outs
+rm -rf ${sample_name}
+
+# Metrics
+cp ${name}_outs/web_summary.html ${name}_web_summary.html
+cp ${name}_outs/metrics_summary.csv "${name}_metrics_summary.csv"
+
+cp ${name}_outs/molecule_info.h5 ${name}_molecule_info.h5
+
+# Moving Standard resolution 008um h5 files
+cp ${name}_outs/binned_outputs/square_008um/filtered_feature_bc_matrix.h5 ${name}_filtered_feature_bc_matrix.h5
+cp ${name}_outs/binned_outputs/square_008um/raw_feature_bc_matrix.h5 ${name}_raw_feature_bc_matrix.h5
+
+# Visium HD special h5 file for 2um processing: https://www.10xgenomics.com/support/software/space-ranger/latest/analysis/outputs/space-ranger-feature-slice-h5
+cp ${name}_outs/feature_slice.h5 ${name}_feature_slice.h5
+
+# Spatial outputs
+cp -r ${name}_outs/spatial ${name}_spatial
+
+# Cloupe 8um data
+cp ${name}_outs/binned_outputs/square_008um/cloupe.cloupe ${name}_cloupe.cloupe
+
+"""

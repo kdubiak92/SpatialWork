@@ -1,0 +1,427 @@
+---
+title: "Visium HD Seurat preprocessing"
+author: "Steve Osazuwa"
+output: 
+  html_document:
+    toc: true
+    toc_float:
+      toc_collapsed: true
+      toc_depth: 3
+    number_sections: true
+    fig_caption: yes
+    theme: cerulean
+    code_folding: hide
+params:
+  input_dir: "data/space_ranger_output_tarball/SD-A1/outs" # Path to Space Ranger output directory
+  sample_id: "SD-A1" # Sample identifier
+  target_bin: "Spatial.008um" # Bin size for spatial analysis (002um, 008um, or 016um)
+  output_directory: "output_directory_manual" # Directory for saving output files
+  detected_genes_low_threshold: 0.01 # Lower quantile threshold for gene detection
+  detected_genes_high_threshold: 0.99 # Upper quantile threshold for gene detection
+  umi_count_low_threshold: 0.01 # Lower quantile threshold for UMI counts
+  umi_count_high_threshold: 0.99 # Upper quantile threshold for UMI counts
+  ribosomal_contents_threshold: 25 # Maximum percentage of ribosomal genes allowed
+  mitochondrial_contents_threshold: 50 # Maximum percentage of mitochondrial genes allowed
+  norm_method: "LogNormalize" # Normalization method (LogNormalize, SCTransform, etc.)
+  varFeatures: 2000 # Number of variable features to select
+  remove_mito_genes: FALSE # Whether to filter cells based on mitochondrial content
+  remove_ribo_genes: FALSE # Whether to filter cells based on ribosomal content
+  npcs: 20 # Number of principal components to use
+---
+
+```{r setup, include=FALSE}
+all_times <- list() # store the time for each chunk
+knitr::knit_hooks$set(time_it = local({
+  now <- NULL
+  function(before, options) {
+    if (before) {
+      now <<- Sys.time()
+    } else {
+      res <- difftime(Sys.time(), now, units = "secs")
+      all_times[[options$label]] <<- res
+    }
+  }
+}))
+knitr::opts_chunk$set(
+  tidy = "styler",
+  message = FALSE,
+  warning = FALSE,
+  fig.width = 10,
+  time_it = TRUE,
+  error = TRUE
+)
+```
+
+```{r library_setup, include=FALSE}
+library(Seurat)
+library(ggplot2)
+library(patchwork)
+library(dplyr)
+```
+
+```{r param_helpers, include=FALSE}
+target_bin <- params$target_bin
+sample_id <- params$sample_id
+norm_method <- params$norm_method
+input_dir <- params$input_dir
+variable_features <- as.numeric(params$varFeatures)
+
+# QC Params
+umi_count_low_threshold <- as.numeric(params$umi_count_low_threshold)
+umi_count_high_threshold <- as.numeric(params$umi_count_high_threshold)
+detected_genes_low_threshold <- as.numeric(params$detected_genes_low_threshold)
+detected_genes_high_threshold <- as.numeric(params$detected_genes_high_threshold)
+
+remove_mito_genes <- params$remove_mito_genes
+remove_ribo_genes <- params$remove_ribo_genes
+mitochondrial_contents_threshold <- as.numeric(params$mitochondrial_contents_threshold)
+ribosomal_contents_threshold <- as.numeric(params$ribosomal_contents_threshold)
+
+# Additional parameters
+output_directory <- params$output_directory
+npcs <- if (!is.null(params$npcs)) as.numeric(params$npcs) else 20
+```
+
+# Visium HD Sample preprocessing { .tabset }
+
+This document outlines the preprocessing steps for Visium HD spatial transcriptomics data using Seurat v5. The analysis includes quality control, filtering, normalization, variable feature selection, dimensionality reduction, clustering, and spatial visualization.
+
+```{r load_data, include=FALSE}
+bin.size <- switch(target_bin,
+  "Spatial.002um" = 2,
+  "Spatial.008um" = 8,
+  "Spatial.016um" = 16,
+  stop("Invalid target_bin value")
+)
+
+object <- Load10X_Spatial(data.dir = input_dir, bin.size = bin.size, slice = sample_id)
+
+DefaultAssay(object) <- target_bin
+```
+
+```{r set_metadata, include=FALSE}
+object@meta.data$sample_id <- sample_id
+```
+
+## Pre-filter Metrics
+
+```{r qc_variables, include=FALSE}
+# Construct column names dynamically based on selected bin size
+nFeature_col <- paste0("nFeature_", target_bin)
+nCount_col <- paste0("nCount_", target_bin)
+```
+
+```{r qc_metric_calc, include=FALSE}
+# These patterns are specific to Mouse model organism
+object$percent.mt <- PercentageFeatureSet(object, pattern = "^mt-")
+object$percent.ribo <- PercentageFeatureSet(object, pattern = "^RP[SL]")
+```
+
+```{r pre_filter_qc, echo=TRUE}
+pre_rna_count_plot <- VlnPlot(object, group.by = "sample_id", features = nCount_col, pt.size = 0) + NoLegend() + xlab("") + ggtitle(paste0("Pre-Filter ", target_bin, " Counts"))
+
+pre_feature_count_plot <- VlnPlot(object, group.by = "sample_id", features = nFeature_col, pt.size = 0) + NoLegend() + xlab("") + ggtitle(paste0("Pre-Filter ", target_bin, " Features"))
+
+pre_rna_count_plot | pre_feature_count_plot
+```
+
+## Filtering Thresholds
+
+Quality control filtering is essential for removing low-quality spots and potential artifacts from spatial transcriptomics data. Our filtering strategy includes:
+
+1. **Feature (Gene) Count Filtering**: Removes spots with too few or too many detected genes, which could indicate empty spots or technical artifacts.
+2. **UMI Count Filtering**: Eliminates spots with abnormally low or high RNA molecule counts.
+3. **(Optional) Mitochondrial Content Filtering**: Can remove spots with high mitochondrial gene expression, which often indicates damaged or dying cells.
+4. **(Optional) Ribosomal Content Filtering**: Can filter spots with unusual ribosomal gene content, which might indicate technical artifacts.
+
+The thresholds below are quantile-based, allowing for data-driven filtering that adapts to the distribution of your specific dataset.
+
+```{r qc_settings, echo=TRUE}
+qc_settings <- data.frame(
+  Options = c("Filter Mitochondrial Genes", "Filter Ribosomal Genes"),
+  Enabled = c(remove_mito_genes, remove_ribo_genes)
+)
+
+knitr::kable(qc_settings, caption = "QC Settings")
+```
+
+```{r filter_thresholds_table}
+thresholds <- data.frame(
+  Parameter = c("nFeature_RNA Lower Threshold", "nFeature_RNA Higher Threshold", "nCount_RNA Lower Threshold", "nCount_RNA Higher Threshold", "Mitochondrial Percents Threshold", "Ribosomal Percent Threshold"),
+  Value = c(detected_genes_low_threshold, detected_genes_high_threshold, umi_count_low_threshold, umi_count_high_threshold, mitochondrial_contents_threshold, ribosomal_contents_threshold),
+  Units = c("Quantile", "Quantile", "Quantile", "Quantile", "%", "%")
+)
+
+knitr::kable(thresholds, caption = "Filter Thresholds")
+```
+
+```{r filtering, include=FALSE}
+# Calculate thresholds using metadata columns
+min_features <- quantile(object@meta.data[[nFeature_col]], detected_genes_low_threshold)
+max_features <- quantile(object@meta.data[[nFeature_col]], detected_genes_high_threshold)
+min_umi <- quantile(object@meta.data[[nCount_col]], umi_count_low_threshold)
+max_umi <- quantile(object@meta.data[[nCount_col]], umi_count_high_threshold)
+
+# Build filtering condition using metadata values
+subset_cond <- object@meta.data[[nFeature_col]] > min_features &
+  object@meta.data[[nFeature_col]] < max_features &
+  object@meta.data[[nCount_col]] > min_umi &
+  object@meta.data[[nCount_col]] < max_umi
+
+if (remove_mito_genes) {
+  cat("Filtering spots with high mitochondrial gene content...\n")
+  subset_cond <- subset_cond & (object@meta.data$percent.mt < mitochondrial_contents_threshold)
+} else {
+  cat("Mitochondrial gene filtering disabled.\n")
+}
+
+if (remove_ribo_genes) {
+  cat("Filtering spots with high ribosomal gene content...\n")
+  subset_cond <- subset_cond & (object@meta.data$percent.ribo < ribosomal_contents_threshold)
+} else {
+  cat("Ribosomal gene filtering disabled.\n")
+}
+
+# Identify cell names to keep
+cells_to_keep <- rownames(object@meta.data)[subset_cond]
+
+# Subset the object using cell names
+object <- subset(object, cells = cells_to_keep)
+```
+
+# QC Plots {.tabset}
+
+The following plots compare the pre- and post-filtering distributions of RNA molecule counts and feature counts across spots. These visualizations help assess the impact of our quality control filters and verify that the filtering parameters effectively removed low-quality spots while preserving the overall data structure. The comparison allows us to evaluate whether our QC thresholds were appropriate for this dataset.
+
+## RNA Counts
+
+This plot shows the distribution of RNA molecule counts across spots before and after filtering.
+The comparison helps verify that our QC thresholds effectively removed low-quality spots.
+
+```{r rna_rount_qc, echo=TRUE}
+rna_count_plot <- VlnPlot(object, group.by = "sample_id", features = paste0("nCount_", target_bin), pt.size = 0) +
+  NoLegend() +
+  xlab("") +
+  ggtitle(paste0("Filtered ", target_bin, " Counts"))
+
+pre_rna_count_plot | rna_count_plot
+```
+
+## Feature Counts
+
+This visualization compares the number of detected genes (features) per spot before and after filtering.
+Higher feature counts generally indicate better-quality spots with more comprehensive gene detection.
+
+```{r feature_rount_qc, echo=TRUE}
+feature_count_plot <- VlnPlot(object, group.by = "sample_id", features = paste0("nFeature_", target_bin), pt.size = 0) + NoLegend() + xlab("") +
+  ggtitle(paste0("Filtered ", target_bin, " Features"))
+
+feature_count_plot | pre_feature_count_plot
+```
+
+# Spatial Plots {.tabset}
+
+These visualizations map key quality metrics onto their spatial locations in the tissue,
+helping identify any spatial patterns in data quality or potential technical artifacts.
+
+Total RNA molecules and Features per spot heatmap provides a spatial representation of RNA and feature abundance across the tissue section. Each spot corresponds to a specific location on the tissue, with the color intensity indicating the total number of RNA molecules or Features detected in that spot. Refer to the legend to understand color scale.
+
+## RNA Molecule Counts
+
+```{r spatial_umi_count, echo=TRUE}
+# Confirm the UMI counts feature exists
+if (!nCount_col %in% colnames(object[[]])) {
+  stop(
+    c("Feature not found in object metadata. Feature name: ", nCount_col)
+  )
+}
+
+# Create the heatmap of total RNA molecules
+rna_heatmap <- SpatialFeaturePlot(
+  object,
+  features = nCount_col,
+  image.alpha = 0.8 # Adjust transparency of the tissue image
+) +
+  scale_fill_gradientn(colors = c("blue", "yellow", "red"), name = "RNA Molecules") + # Customize colors
+  ggtitle("Total RNA Molecules per Spot") +
+  theme(legend.position = "right")
+
+# Display the heatmap
+rna_heatmap
+```
+
+## Feature Counts per Spot
+
+```{r spatial_feature_count, echo=TRUE}
+# Confirm the UMI counts feature exists
+if (!nFeature_col %in% colnames(object[[]])) {
+  stop(
+    c("Feature not found in object metadata. Feature name: ", nFeature_col)
+  )
+}
+
+# Create the heatmap of total RNA molecules
+feature_heatmap <- SpatialFeaturePlot(
+  object,
+  features = nFeature_col,
+  image.alpha = 0.8 # Adjust transparency of the tissue image
+) +
+  scale_fill_gradientn(colors = c("blue", "yellow", "red"), name = "Feature Counts") + # Customize colors
+  ggtitle("Total Features per Spot") +
+  theme(legend.position = "right")
+
+# Display the heatmap
+feature_heatmap
+```
+
+# Normalize datasets
+
+Make sure to review and understand the impact of normalization methods on your Spatial data. The following article is a great source to help decide on the best normalization method for your data:
+
+https://genomebiology.biomedcentral.com/articles/10.1186/s13059-024-03241-7
+
+By default we use Log normalization. Log normalization is a widely utilized approach in single-cell and spatial transcriptomics for transforming raw gene expression counts into a comparable scale, addressing variations introduced by differences in sequencing depth or library size. 
+
+```{r normalize, include=FALSE}
+cat("Normalizing data using", norm_method, "method...\n")
+object <- NormalizeData(object, normalization.method = norm_method)
+```
+
+```{r plot_pre_post_norm, echo=TRUE}
+nCount_colname <- paste0("nNorm_counts_", target_bin)
+
+nCount_col_normalized <- colSums(LayerData(object, layer = "data"))
+object@meta.data[[nCount_colname]] <- as.numeric(nCount_col_normalized)
+
+pre_norm_feature_scatter <- FeatureScatter(object, feature1 = nCount_col, feature2 = nFeature_col, group.by = "sample_id") + ggtitle("Pre-Normalization")
+
+norm_feature_scatter <- FeatureScatter(object, feature1 = nCount_colname, feature2 = nFeature_col, group.by = "sample_id") + ggtitle("Post-Normalization")
+
+pre_norm_feature_scatter | norm_feature_scatter
+```
+
+# Variable Features
+
+Variable features are genes that exhibit significant biological variation across the dataset. Identifying these features is crucial for downstream analyses, such as clustering and dimensionality reduction, as they capture the most informative genes for distinguishing cell types or spatial patterns. The following plots visualize the top variable genes identified in the dataset.
+
+```{r find_variable_features, include=FALSE, echo=TRUE}
+# Find variable features in the original assay
+object <- FindVariableFeatures(
+  object,
+  nfeatures = variable_features
+)
+```
+
+## Top 9 Variable Genes
+
+```{r top_var_plot, echo=TRUE}
+top10 <- head(VariableFeatures(object), 9)
+varplot <- VariableFeaturePlot(object, selection.method = "vst")
+varplot <- LabelPoints(plot = varplot, points = top10, repel = TRUE)
+
+varplot
+```
+
+# Clustering  {.tabset}
+
+## PCA
+
+```{r include=FALSE}
+pca_attr <- paste0("pca.", target_bin)
+
+object <- ScaleData(object)
+object <- RunPCA(object, reduction.name = pca_attr, npcs = 100)
+```
+
+Elbow plots are used to determine the optimal number of principal components to retain for downstream analyses. The plot shows the standard deviation of each principal component, with a clear "elbow" point indicating the optimal number of components to retain. The elbow point is where the standard deviation curve starts to flatten, suggesting that additional components capture diminishing variance. Assess your input PC (green) versus the detected elbow (red).
+
+Note: We select 2 PCs above the detected elbow point as the inferred optimal number of PCs to retain.
+
+```{r elbow_plots, echo=TRUE}
+ElbowpotData <- data.frame(stdev = object@reductions[[pca_attr]]@stdev, PCs = seq(1, length(object@reductions[[pca_attr]]@stdev)))
+
+pc.changes <- (diff((ElbowpotData$stdev))) * (-1)
+pc.changes.raw <- pc.changes
+pc.changes <- which(pc.changes >= mean(pc.changes.raw[pc.changes.raw > 0]))
+
+ideal_pc <- max(pc.changes) + 2
+
+ggplot(ElbowpotData, aes(x = PCs, y = stdev, label = PCs)) +
+  geom_point() +
+  theme_bw() +
+  geom_vline(aes(xintercept = ideal_pc, color = "Detected Elbow PC"), linetype = "dashed") +
+  geom_vline(aes(xintercept = npcs, color = "Current Set PC"), linetype = "dashed") +
+  scale_color_manual(values = c("Detected Elbow PC" = "darkred", "Current Set PC" = "green")) +
+  ggtitle(paste(target_bin, "PCA", "Elbow curve")) +
+  labs(color = "Vertical Lines")
+```
+
+## Identified Clusters {.tabset}
+
+```{r cluster_gen, include=FALSE}
+cluster_attr <- paste0("seurat_cluster.", target_bin)
+
+object <- FindNeighbors(object, reduction = pca_attr, dims = 1:npcs)
+object <- FindClusters(object, resolution = 0.6, cluster.name = cluster_attr)
+```
+
+```{r run_umap, include=FALSE}
+umap_attr <- paste0("umap.", target_bin)
+object <- RunUMAP(object, reduction = pca_attr, reduction.name = umap_attr, dims = 1:npcs, return.model = TRUE)
+```
+
+```{r plot_umap, echo=TRUE}
+dim.plot <- DimPlot(object,
+  reduction = umap_attr,
+  group.by = cluster_attr,
+  label = TRUE,
+  repel = TRUE,
+  label.size = 3
+) + NoLegend()
+```
+
+### Spatial Clusters
+
+```{r show_cluster_plots, echo=TRUE}
+cluster.plot <- SpatialDimPlot(object, group.by = cluster_attr, label = FALSE, pt.size.factor = 1.2) +
+  theme(legend.position = "right") + ggtitle(paste0("spatial_cluster.resolution0.6.", target_bin))
+
+cluster.plot
+```
+
+### UMAP
+
+```{r show_cluster_umap, echo=TRUE}
+dim.plot
+```
+
+### Top 9 Variable Features Clusters
+
+```{r variable_feature_plot}
+var_feature_plot <- FeaturePlot(
+  object = object,
+  features = VariableFeatures(object, nfeatures = 9),
+  ncol = 3
+)
+
+var_feature_plot
+```
+
+# Wrap up
+
+The preprocessing steps have been completed, and the data is ready for downstream analysis. We store only the `r target_bin` assay in the processed Seurat object to reduce file size and improve computational efficiency downstream. The processed object is available as an RDS file for future analysis.
+
+```{r save_seurat, echo=TRUE}
+out_rds_name <- paste0(sample_id, "_processed.rds")
+
+if (!dir.exists(output_directory)) {
+  dir.create(output_directory, recursive = TRUE)
+}
+
+saveRDS(
+  object,
+  file = file.path(
+    output_directory, out_rds_name
+  )
+)
+```

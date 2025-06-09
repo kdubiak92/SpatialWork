@@ -1,0 +1,71 @@
+FROM rocker/r-base:4.3.2
+
+LABEL maintainer="kyle@viascientific.com" \
+      description="Docker image for Seurat v5 object to h5ad conversion (rocker/r-base variant)"
+
+# Set the system locale for consistent behavior across environments
+ENV LANG=C.UTF-8 LC_ALL=C.UTF-8
+
+# --- System Dependencies ---
+# Install necessary system dependencies, including R build tools and
+# all the libraries needed for Seurat and its dependencies.
+# We are starting from a more minimal R base image, so more tools are needed.
+RUN apt-get update -qq && apt-get install -y --no-install-recommends \
+    # R build tools
+    # Core R package dependencies
+    libcurl4-openssl-dev \
+    libssl-dev \
+    libxml2-dev \
+    libhdf5-dev \
+    # General utilities
+    wget \
+    unzip \
+    pandoc \
+    ca-certificates \
+    git \
+    # Graphics/Font dependencies (for ragg, ggplot2, Seurat plotting)
+    libfontconfig1-dev \
+    libharfbuzz-dev \
+    libfribidi-dev \
+    libfreetype6-dev \
+    libpng-dev \
+    libtiff5-dev \
+    libjpeg-dev \
+    # OpenMP libraries for robust Rcpp/Matrix compilation/loading
+    libgomp1 \
+    libomp-dev \
+    # G++ compiler (for Rcpp and many R packages with C++ code)
+    g++ \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+# --- R Package Installation ---
+# Now, we will install everything from source using install.packages.
+# No need for install2.r or explicit .libPaths() as we're building from scratch.
+
+# Install 'remotes' first
+RUN R -e "install.packages('remotes', repos = 'https://cloud.r-project.org', type = 'source')"
+
+# Explicitly install 'Matrix' first. This is still crucial.
+# Because we are starting with a very minimal R environment, this should
+# correctly install the latest Matrix and place it where R expects it.
+RUN R -e "install.packages('Matrix', repos = 'https://cloud.r-project.org', type = 'source')"
+
+# Install SeuratObject v5 directly from GitHub
+RUN R -e "remotes::install_github('satijalab/seurat-object', ref = 'master', build_vignettes = FALSE, build = FALSE)"
+
+# Install Seurat v5 directly from GitHub's 'seurat5' branch
+RUN R -e "remotes::install_github('satijalab/seurat', ref = 'seurat5', build_vignettes = FALSE, build = FALSE)"
+
+# **NEW STEP: Install 'muon' package from CRAN for h5ad conversion**
+#RUN R -e "install.packages('muon', repos = 'https://cloud.r-project.org', type = 'source', dependencies = TRUE)"
+
+# Install MuDataSeurat from GitHub
+#RUN R -e "remotes::install_github('PMBio/MuDataSeurat', build_vignettes = FALSE, build = FALSE)"
+
+# --- Final Touches ---
+# Set default working directory
+WORKDIR /data
+
+# Default CMD - You'll likely run an R script for the conversion
+CMD ["R"]
